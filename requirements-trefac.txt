@@ -1,0 +1,3 @@
+# trefac_app の実ランタイム依存（requirements.txt は全システムのpip freezeなので別管理）
+requests
+boto3

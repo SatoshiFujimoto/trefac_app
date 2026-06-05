@@ -1,0 +1,40 @@
+; trefac_app 設定テンプレート。各箱で setting/config.ini としてコピーし実値を埋める。
+; [Credentials]=eBay/LINE/Gmail等の秘密(実値は別管理), [spaces]=Spaces取得用, [Settings]=動作チューニング
+; ★各箱で必ず変えるのは [Settings] の shard_index (0..N-1)。
+
+[Credentials]
+ritz_refresh_token = <REDACTED - 各箱で実値を設定>
+sushi002_auth_token = <REDACTED - 各箱で実値を設定>
+ebay_basic_auth = <REDACTED - 各箱で実値を設定>
+yahoo_shopping_client_id = <REDACTED - 各箱で実値を設定>
+line_messaging_api = <REDACTED - 各箱で実値を設定>
+gmail_app_pass = <REDACTED - 各箱で実値を設定>
+DISCORD_WEBHOOK_URL = <REDACTED - 各箱で実値を設定>
+
+[Settings]
+judgment_word = カートに入れる
+request_timeout = 30
+max_retries = 3
+check_interval = 3
+retry_check_interval = 2
+max_workers = 2
+request_interval_min = 2.0
+request_interval_max = 5.0
+shard_count = 2
+shard_index = 0
+token_refresh_interval = 6600
+input_file_pattern = aki - sushionsen_up_04*.csv
+output_file_name = requests_reviced_item_list.csv
+mail_subject = Sushi0の結果
+min_response_length = 100
+line_user_id = <REDACTED - LINE宛先ユーザーID>
+user_agents = Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36, Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36, Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36, Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36, Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36, Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36
+
+[spaces]
+access_key = DOxxxxxxxxxxxxxxxxxx
+secret_key = <REDACTED - Spaces Secret>
+bucket = sushi-onsen-storage
+region = sgp1
+object_key = trefac/input.csv
+local_file = aki - sushionsen_up_04_master.csv
+
