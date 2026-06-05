@@ -1,0 +1,1 @@
+00 4,10,16,22 * * * cd /home/fujiken/my_app && python3 aki_requests.py > /dev/null 2> /home/fujiken/my_app/log/error.log

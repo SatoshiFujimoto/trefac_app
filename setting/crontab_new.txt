@@ -1,0 +1,3 @@
+# aki_requests.py 在庫チェック（1日3回 / 8時間間隔）
+# flock -n で二重起動を防止（前回がまだ動いていたらスキップ）
+0 0,8,16 * * * /usr/bin/flock -n /tmp/aki_requests.lock -c 'cd /home/fujiken/my_app && python3 aki_requests.py' > /dev/null 2> /home/fujiken/my_app/log/error.log

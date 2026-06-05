@@ -1,0 +1,21 @@
+# ===== secrets / credentials（絶対にコミットしない） =====
+setting/config.ini
+key/
+
+# ===== Python =====
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# ===== data（入力/出力CSVはSpaces配布。リポジトリには入れない） =====
+*.csv
+
+# ===== logs（log設定json=aki_requests_log_config.json は残す） =====
+log/*.log
+
+# ===== ローカルツール =====
+.claude/
+
+# ===== misc =====
+.DS_Store
