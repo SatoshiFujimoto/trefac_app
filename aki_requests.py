@@ -3,6 +3,7 @@ import glob
 import configparser
 import hashlib
 import json
+import os
 import random
 import re
 import socket
@@ -108,6 +109,34 @@ def derive_shard_index_from_hostname() -> int:
     return index
 
 
+# fleet.json: 全サーバー台数(shard_count)を一元管理する設定ファイル。
+# run_trefac.sh -> fetch_input.py が Spaces からDLしてこの場所に置く。
+# 台数を変える時は Spaces の fleet.json を1か所直すだけで、全台が次回runで追従する。
+FLEET_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fleet.json')
+
+
+def derive_shard_count_from_fleet() -> int:
+    """shard_count='auto' のとき、fleet.json の shard_count を読む。
+
+    全台で台数を一元管理するための仕組み（増設時は fleet.json を1か所直すだけ）。
+    読めない/不正な場合は、誤った分割（チェック漏れ・重複）を避けるため起動を中止する。
+    """
+    try:
+        with open(FLEET_FILE, 'r', encoding='utf-8') as f:
+            count = int(json.load(f)['shard_count'])
+    except (FileNotFoundError, json.JSONDecodeError, KeyError, ValueError, TypeError, OSError) as e:
+        logger.error(
+            f'shard_count=auto ですが fleet.json を読めません（{FLEET_FILE}）: {e}。'
+            '誤分割防止のため中止します。'
+        )
+        sys.exit(1)
+    if count < 1:
+        logger.error(f'fleet.json の shard_count={count} は不正です（1以上必須）。中止します。')
+        sys.exit(1)
+    logger.info(f'shard_count=auto: fleet.json から shard_count={count} を取得しました。')
+    return count
+
+
 class AppSettings:
     """アプリケーション設定を保持するクラス"""
     def __init__(self, config: configparser.ConfigParser):
@@ -157,7 +186,12 @@ class AppSettings:
             # シャーディング設定（複数サーバーで担当を分割してアクセスを分散）
             # shard_count: 全サーバー台数, shard_index: このサーバーの番号(0始まり)
             # 各商品は eBay Item Number から計算で担当サーバーが一意に決まる
-            self.shard_count = int(settings.get('shard_count', '1'))
+            raw_count = str(settings.get('shard_count', '1')).strip()
+            if raw_count.lower() == 'auto':
+                # fleet.json から取得（増設時は fleet.json を1か所直すだけで全台追従）
+                self.shard_count = derive_shard_count_from_fleet()
+            else:
+                self.shard_count = int(raw_count)
             raw_index = str(settings.get('shard_index', '0')).strip()
             if raw_index.lower() == 'auto':
                 # ホスト名から自動算出（例 yahoo-inv-01 -> 0）。全台で config.ini を同一にできる

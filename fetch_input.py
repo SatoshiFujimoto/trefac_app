@@ -21,6 +21,13 @@ trefac本体(aki_requests.py)の実行前に run_trefac.sh から呼ばれる前
   prefix      = trefac/                            （走査するフォルダ。配下の最新.csvを取得）
   local_file  = aki - sushionsen_up_04_master.csv  （input_file_pattern に一致する保存名）
   # 後方互換: prefix の代わりに object_key=trefac/input.csv で固定名取得も可
+
+任意キー（無ければ既定値を使う）:
+  fleet_key   = trefac/fleet.json   （全台の台数=shard_count を一元管理するJSON。
+                                       既定: prefix配下の fleet.json）
+  fleet_local = fleet.json          （保存名。aki_requests.py が shard_count=auto の時に読む）
+  ※ fleet.json の中身: {"shard_count": 9} のように台数を1つ書くだけ。
+    取得失敗時は既存のローカル fleet.json で継続する（CSVと同じく止めない方針）。
 """
 import configparser
 import glob
@@ -49,6 +56,30 @@ def _pick_object_key(client, bucket: str, prefix: str) -> str:
     print(f"[fetch_input] 対象: s3://{bucket}/{newest['Key']} "
           f"(更新={newest['LastModified']})")
     return newest["Key"]
+
+
+def _try_download_fleet(client, bucket: str, key: str, dest: str) -> None:
+    """fleet.json（全台の台数を一元管理する設定）を取得しアトミック置換する。
+
+    台数設定は補助情報なので、DL失敗しても例外は投げない
+    （既存のローカル fleet.json があればそれで継続させる）。
+    """
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(dest) or ".", prefix=".fleet_dl_")
+        os.close(fd)
+        client.download_file(bucket, key, tmp)
+        os.replace(tmp, dest)  # アトミック置換
+        tmp = None
+        print(f"[fetch_input] fleet取得: s3://{bucket}/{key} -> {os.path.basename(dest)}")
+    except Exception as e:
+        print(f"[fetch_input] fleet取得スキップ（既存のローカル値で継続）: {e}", file=sys.stderr)
+    finally:
+        if tmp and os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
 
 def main() -> int:
@@ -103,6 +134,14 @@ def main() -> int:
         tmp = None
         size = os.path.getsize(local_path)
         print(f"[fetch_input] DL成功: {key_to_get} -> {local_file} ({size} bytes)")
+
+        # fleet.json（全台の台数=shard_count を一元管理）も取得する。
+        # 失敗してもCSV処理は止めない（既存のローカル fleet.json で継続）。
+        fleet_key = sp.get("fleet_key") or (
+            (prefix.rstrip("/") + "/fleet.json") if prefix else "trefac/fleet.json"
+        )
+        fleet_local = sp.get("fleet_local", "fleet.json")
+        _try_download_fleet(client, bucket, fleet_key, os.path.join(HERE, fleet_local))
         return 0
     except Exception as e:
         print(f"[fetch_input] DL失敗: {e}", file=sys.stderr)

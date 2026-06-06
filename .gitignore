@@ -11,6 +11,9 @@ __pycache__/
 # ===== data（入力/出力CSVはSpaces配布。リポジトリには入れない） =====
 *.csv
 
+# ===== fleet（全台の台数=shard_count。Spaces配布が正。誤分割防止のため固定値は持たない） =====
+fleet.json
+
 # ===== logs（log設定json=aki_requests_log_config.json は残す） =====
 log/*.log
 
