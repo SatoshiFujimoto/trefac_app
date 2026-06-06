@@ -38,6 +38,6 @@ access_key = DOxxxxxxxxxxxxxxxxxx
 secret_key = <REDACTED - Spaces Secret>
 bucket = sushi-onsen-storage
 region = sgp1
-object_key = trefac/input.csv
+prefix = trefac/
 local_file = aki - sushionsen_up_04_master.csv
 
