@@ -22,7 +22,7 @@
             "class": "logging.FileHandler",
             "level": "INFO",
             "formatter": "simple",
-            "filename": "/home/fujiken/my_app/log/aki_requests.log"
+            "filename": "log/aki_requests.log"
         }
     },
 
