@@ -173,6 +173,18 @@ class AppSettings:
                     f'shard_index={self.shard_index}, shard_count={self.shard_count}'
                 )
                 sys.exit(1)
+
+            # メール件名のプレースホルダを展開（全台で config.ini を同一にできる）
+            #   {shard} -> このサーバーの番号(1始まり, 人が読む用)
+            #   {total} -> 全サーバー台数
+            #   {host}  -> ホスト名
+            # 例: "Sushi {shard}/{total}の結果" -> inv-01 で "Sushi 1/5の結果"
+            self.mail_subject = (
+                self.mail_subject
+                .replace('{shard}', str(self.shard_index + 1))
+                .replace('{total}', str(self.shard_count))
+                .replace('{host}', socket.gethostname())
+            )
         except KeyError as e:
             logger.error(f'設定ファイルに必要なキーがありません: {e}')
             sys.exit(1)
