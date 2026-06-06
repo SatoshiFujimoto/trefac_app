@@ -20,8 +20,11 @@ retry_check_interval = 2
 max_workers = 2
 request_interval_min = 2.0
 request_interval_max = 5.0
-shard_count = 2
-shard_index = 0
+; shard_count = 全台数（全箱で同じ値にすること）。台数を増やす時はここだけ変える。
+shard_count = 5
+; shard_index = この箱の番号(0始まり)。'auto' でホスト名末尾から自動算出(yahoo-inv-01->0)。
+;   auto にすれば 5台すべて config.ini を完全に同一にできる（台ごとの手編集が不要）。
+shard_index = auto
 token_refresh_interval = 6600
 input_file_pattern = aki - sushionsen_up_04*.csv
 output_file_name = requests_reviced_item_list.csv

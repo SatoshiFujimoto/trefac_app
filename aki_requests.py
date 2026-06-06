@@ -4,6 +4,8 @@ import configparser
 import hashlib
 import json
 import random
+import re
+import socket
 import sys
 import time
 from datetime import datetime
@@ -89,6 +91,23 @@ except Exception as e:
     sys.exit(1)
 
 # ===== アプリケーション設定の読み込み =====
+def derive_shard_index_from_hostname() -> int:
+    """shard_index='auto' のとき、ホスト名末尾の数字から番号を算出する。
+
+    例: yahoo-inv-01 -> 0, yahoo-inv-05 -> 4 （末尾の数 - 1）。
+    全台で config.ini を完全に同一にでき、台ごとの手編集（shard_index書き換え）が不要になる。
+    末尾に数字が無いホスト名なら起動を中止する（誤った担当でチェック漏れ/重複を防ぐ）。
+    """
+    hostname = socket.gethostname()
+    m = re.search(r'(\d+)\s*$', hostname)
+    if not m:
+        logger.error(f'shard_index=auto ですが、ホスト名 "{hostname}" の末尾に番号がありません。')
+        sys.exit(1)
+    index = int(m.group(1)) - 1  # 01始まり -> 0始まり
+    logger.info(f'shard_index=auto: ホスト名 "{hostname}" から shard_index={index} を算出しました。')
+    return index
+
+
 class AppSettings:
     """アプリケーション設定を保持するクラス"""
     def __init__(self, config: configparser.ConfigParser):
@@ -139,7 +158,12 @@ class AppSettings:
             # shard_count: 全サーバー台数, shard_index: このサーバーの番号(0始まり)
             # 各商品は eBay Item Number から計算で担当サーバーが一意に決まる
             self.shard_count = int(settings.get('shard_count', '1'))
-            self.shard_index = int(settings.get('shard_index', '0'))
+            raw_index = str(settings.get('shard_index', '0')).strip()
+            if raw_index.lower() == 'auto':
+                # ホスト名から自動算出（例 yahoo-inv-01 -> 0）。全台で config.ini を同一にできる
+                self.shard_index = derive_shard_index_from_hostname()
+            else:
+                self.shard_index = int(raw_index)
             if self.shard_count < 1:
                 logger.warning('shard_countが1未満のため、1に設定します。')
                 self.shard_count = 1

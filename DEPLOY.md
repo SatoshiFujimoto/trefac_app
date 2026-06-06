@@ -36,8 +36,10 @@ venv/bin/pip install -r requirements-trefac.txt
 #     [Credentials] ... 我々のeBayアカウントのトークン等（sushiと同じ値）
 #     [spaces]      ... access_key / secret_key / bucket=sushi-onsen-storage / region=sgp1
 #                       object_key=trefac/input.csv / local_file=aki - sushionsen_up_04_master.csv
-#     [Settings]    ... shard_count = 5
-#                       shard_index = <この箱の番号 0..4>   ★箱ごとに必ず変える
+#     [Settings]    ... shard_count = 5      （全台同じ値）
+#                       shard_index = auto   （ホスト名 yahoo-inv-0N から自動算出 -> N-1）
+#   ★ shard_index=auto なので config.ini は 5台すべて完全に同一でよい（台ごとの手編集不要）。
+#     → sushi の実 config.ini をそのまま5台にコピーするのが最短。
 #   テンプレートは setting/config.ini.example を参照
 cp setting/config.ini.example setting/config.ini   # その後、実値を埋める
 
@@ -59,15 +61,29 @@ flock（二重起動防止・furimaと別ロック）+ timeout（暴走上限）
 30 3,9,15,21 * * * /usr/bin/flock -n /tmp/trefac.lock /usr/bin/timeout 3h /home/fujiken/trefac_app/run_trefac.sh >> /home/fujiken/trefac_app/log/wrapper.log 2>&1
 ```
 
-| 箱(例) | furima | trefac cron |
-|---|---|---|
-| inv-01 | 1,7,13,19  | `30 3,9,15,21`  (index 0) |
-| inv-02 | 2,8,14,20  | `30 4,10,16,22` (index 1) |
-| inv-03 | 3,9,15,21  | `30 5,11,17,23` (index 2) |
-| inv-04 | 4,10,16,22 | `30 6,12,18,0`  (index 3) |
-| inv-05 | 5,11,17,23 | `30 7,13,19,1`  (index 4) |
+| 箱 | furima | trefac cron | shard_index(自動) |
+|---|---|---|---|
+| yahoo-inv-01 | 1,7,13,19  | `30 3,9,15,21`  | 0 |
+| yahoo-inv-02 | 2,8,14,20  | `30 4,10,16,22` | 1 |
+| yahoo-inv-03 | 3,9,15,21  | `30 5,11,17,23` | 2 |
+| yahoo-inv-04 | 4,10,16,22 | `30 6,12,18,0`  | 3 |
+| yahoo-inv-05 | 5,11,17,23 | `30 7,13,19,1`  | 4 |
 
-各箱の実際のfurima時刻は `crontab -l` で確認して合わせる。
+shard_index はホスト名から自動算出されるので config では設定不要（全台 `auto`）。
+cron時刻だけ各箱で異なる（その箱のfurima時刻を `crontab -l` で確認して+約2.5h）。
+
+## 入力CSVの形式
+
+Spaces の `trefac/input.csv` に置くCSVの列（ヘッダ）:
+
+| 列名 | 必須 | 内容 |
+|---|---|---|
+| `仕入れURL` | ○ | trefacの商品ページURL（在庫判定に使用） |
+| `eBay Item Number` | ○ | 対象eBay出品の商品番号（在庫変更対象。シャード割当のキー） |
+| `account` | 推奨 | eBayアカウント識別名（現状は全行 `hiroshima`）。将来の2アカウント対応の布石 |
+
+`account` 列は今は使わない（全行 `hiroshima`）が、付けておくと将来2アカウント化する時に
+過去データの作り直しが不要になる。csv.DictReader 読みなので列が増えても既存処理は壊れない。
 
 ## 3. 切替
 
