@@ -22,6 +22,8 @@ sys.path.insert(0, "/home/fujiken/ebay-pkg")
 from ebay_pkg.trading import EbayApi
 
 from utils.MailSender import MailSender
+# 在庫報告は司令塔(ctrl-01)へ。eBayは司令塔が一括反映する（方式A・設計書§11.2）。
+from fleet_report import report_stock
 
 # logger
 logger = getLogger(__name__)
@@ -546,16 +548,15 @@ def send_request(
 
 def retry_failed_requests(
     failed_items: List[Dict[str, str]],
-    ebay_api: EbayApi,
     judgment_word: Optional[str] = None,
     timeout: Optional[int] = None
 ) -> Dict[str, Union[int, List[str]]]:
     """
     タイムアウトや接続エラーで失敗したアイテムを再チェックし、在庫があれば在庫を1に戻す
+    （eBay反映は司令塔。ここでは report_stock(item_num, True) を司令塔へ送るだけ）
 
     Args:
         failed_items: 失敗したアイテムのリスト [{"url": str, "item_num": str}, ...]
-        ebay_api: EbayApiインスタンス
         judgment_word: 判定文字列（Noneの場合は設定ファイルの値を使用）
         timeout: タイムアウト秒数（Noneの場合は設定ファイルの値を使用）
 
@@ -583,15 +584,15 @@ def retry_failed_requests(
         is_stock = send_request(url, judgment_word, timeout=timeout, max_retries=1)
 
         if is_stock is True:
-            # 在庫ありを確認できた場合、在庫を1に戻す
+            # 在庫ありを確認できた場合、司令塔へ「在庫あり」を報告（→eBayで1に戻る）
             logger.info(f"再チェックで在庫ありを確認: {url} - {item_num}")
-            is_success = ebay_api.revise_inventory(item_num, 1)
-            if is_success == "Success":
+            ok = report_stock(item_num, True)
+            if ok:
                 restored_count += 1
                 restored_items.append(item_num)
-                logger.info(f"在庫を1に戻しました: {item_num} - {url}")
+                logger.info(f"在庫ありを司令塔へ報告しました: {item_num} - {url}")
             else:
-                logger.warning(f"在庫を1に戻せませんでした: {item_num} - {is_success}")
+                logger.warning(f"在庫ありの報告に失敗しました: {item_num}")
                 still_failed_count += 1
                 failed_items_list.append(item_num)
         elif is_stock in ("timeout", "connection_error", "server_error", "short_response"):
@@ -626,29 +627,20 @@ def check_single_item(
     index: int,
     total: int,
     judgment_word: str,
-    ebay_api: EbayApi,
-    result_lock: Lock,
-    token_lock: Lock,
-    token_start_time_ref: List[float],
-    ritz_refresh_token: str,
-    ritz_ebay_api_ref: List[EbayApi],
-    token_refresh_interval: int
+    result_lock: Lock
 ) -> Dict[str, Union[str, bool, int]]:
     """
     1つの商品の在庫状況をチェックする（並列処理用）
+
+    eBayは司令塔(ctrl-01)が一括反映するため、ここではトークン管理もeBay直叩きもしない。
+    在庫変化があれば report_stock(item_num, in_stock) で司令塔へ報告するだけ。
 
     Args:
         item: 商品情報の辞書
         index: 商品のインデックス（1から始まる）
         total: 全商品数
         judgment_word: 判定文字列
-        ebay_api: EbayApiインスタンス（参照用、実際にはritz_ebay_api_refから取得）
-        result_lock: 結果リストへのアクセスを保護するロック
-        token_lock: トークン更新処理を保護するロック
-        token_start_time_ref: トークン更新開始時刻への参照（リストで共有）
-        ritz_refresh_token: リフレッシュトークン
-        ritz_ebay_api_ref: EbayApiインスタンスへの参照（リストで共有）
-        token_refresh_interval: トークン更新間隔（秒）
+        result_lock: 結果リスト/ログへのアクセスを保護するロック
 
     Returns:
         チェック結果の辞書
@@ -670,19 +662,7 @@ def check_single_item(
             "is_blocked": False,
         }
 
-    # トークン更新チェック（Lockで保護）
-    with token_lock:
-        if time.time() - token_start_time_ref[0] > token_refresh_interval:
-            token_start_time_ref[0] = time.time()
-            try:
-                new_token = get_access_token(ritz_refresh_token)
-                ritz_ebay_api_ref[0] = EbayApi(new_token)
-                logger.info("Token refreshed.")
-            except Exception as e:
-                logger.error(f'トークン更新に失敗しました: {e}')
-                # トークン更新に失敗しても処理を続行（既存のトークンで試行）
-        # 最新のEbayApiインスタンスを取得
-        ebay_api = ritz_ebay_api_ref[0]
+    # （トークン更新・eBay直叩きは司令塔へ移管したため、ここでは不要）
 
     # サーバー負荷を考慮してリクエスト送信前にランダムな待機時間
     # （設定ファイルの request_interval_min〜max の範囲。頻度を下げてブロック回避）
@@ -749,42 +729,26 @@ def check_single_item(
         with result_lock:
             logger.warning(f"{index}/{total} リクエスト失敗 ({error_type_name}): {url} - 一旦在庫を0にして後で再チェックします")
 
-        # 安全のため一旦在庫を0にする
-        is_success = ebay_api.revise_inventory_zero(item_num)
-        if is_success == "Success":
+        # 安全のため一旦「在庫なし」を司令塔へ報告（→eBayで0になる）。後で再チェック対象。
+        ok = report_stock(item_num, False)
+        result["failed_request"] = {"url": url, "item_num": item_num}
+        if ok:
             with result_lock:
-                logger.info(f"{index}/{total} リクエスト失敗のため在庫を0にしました: {item_num}")
+                logger.info(f"{index}/{total} リクエスト失敗のため在庫0を司令塔へ報告: {item_num}")
             result["no_stock_item"] = item_num
-            result["failed_request"] = {"url": url, "item_num": item_num}
-        elif is_success == "Warning":
-            with result_lock:
-                logger.info(f"{index}/{total} リクエスト失敗: 既に0かエンドです: {item_num}")
-            result["no_stock_item"] = item_num
-            result["failed_request"] = {"url": url, "item_num": item_num}
         else:
             with result_lock:
-                logger.warning(f"{index}/{total} リクエスト失敗: 在庫を0にできませんでした: {item_num} - {is_success}")
+                logger.warning(f"{index}/{total} リクエスト失敗: 在庫0の報告に失敗: {item_num}")
     else:
-        # 在庫なしの場合（正常にページ取得できたが在庫なし）
-        is_success = ebay_api.revise_inventory_zero(item_num)
-        if is_success == "Success":
-            message = f"{index}/{total} NOT INV endにしました。\n{url}\nhttps://www.ebay.com/itm/{item_num}"
+        # 在庫なしの場合（正常にページ取得できたが在庫なし）→ 司令塔へ報告（→eBayで0）
+        ok = report_stock(item_num, False)
+        if ok:
+            message = f"{index}/{total} NOT INV 在庫0を司令塔へ報告。\n{url}\nhttps://www.ebay.com/itm/{item_num}"
             with result_lock:
                 logger.info(message)
             result["no_stock_item"] = item_num
-        elif is_success == "Warning":
-            message = f"{index}/{total} NOT INV 既に0かエンドです。\n{url}\nhttps://www.ebay.com/itm/{item_num}"
-            with result_lock:
-                logger.info(message)
-            result["no_stock_item"] = item_num
-        elif is_success == "Failure":
-            message = f" Error 在庫なし ebayに反映出来ませんでした。\n{url}\nhttps://www.ebay.com/itm/{item_num}"
-            with result_lock:
-                logger.error(message)
-                line_notify(message)
-            result["no_stock_item"] = message
         else:
-            message = f"在庫なし 予想外のエラーです。 https://www.ebay.com/itm/{item_num}"
+            message = f" Error 在庫なし 司令塔への報告に失敗しました。\n{url}\nhttps://www.ebay.com/itm/{item_num}"
             with result_lock:
                 logger.error(message)
                 line_notify(message)
@@ -865,24 +829,8 @@ def main() -> None:
     all_list = len(search_items)
     logger.info(f'{all_list}件の在庫を調べます（並列数: {max_workers}）')
 
-    # タイマースタート（トークン更新のタイミングを管理）
-    token_start_time = time.time()
-
-    # eBay APIインスタンス作成
-    try:
-        ritz_auth_token = get_access_token(ritz_refresh_token)
-        ritz_ebay_api = EbayApi(ritz_auth_token)
-    except Exception as e:
-        logger.error(f'eBay APIトークンの取得に失敗しました: {e}')
-        return
-
-    # 並列処理用のロック
+    # eBay反映・トークン管理は司令塔(ctrl-01)へ移管。ワーカーはログ/結果保護のロックのみ。
     result_lock = Lock()
-    token_lock = Lock()  # トークン更新処理を保護するロック
-
-    # トークン更新用の共有変数（リストで参照渡し）
-    token_start_time_ref = [token_start_time]
-    ritz_ebay_api_ref = [ritz_ebay_api]
 
     # 並列処理で各商品の在庫状況をチェック
     if max_workers == 1:
@@ -890,9 +838,7 @@ def main() -> None:
         logger.info('順次処理モードで実行します')
         for i, item in enumerate(search_items, 1):
             result = check_single_item(
-                item, i, all_list, judgment_word, ritz_ebay_api, result_lock,
-                token_lock, token_start_time_ref, ritz_refresh_token,
-                ritz_ebay_api_ref, token_refresh_interval
+                item, i, all_list, judgment_word, result_lock
             )
 
             # ブロック検出の場合は即座に処理を停止
@@ -920,13 +866,7 @@ def main() -> None:
                     i,
                     all_list,
                     judgment_word,
-                    ritz_ebay_api,
-                    result_lock,
-                    token_lock,
-                    token_start_time_ref,
-                    ritz_refresh_token,
-                    ritz_ebay_api_ref,
-                    token_refresh_interval
+                    result_lock
                 )
                 futures[future] = i
 
@@ -968,8 +908,7 @@ def main() -> None:
         logger.warning("ブロック中断のため、失敗リクエストの再チェックはスキップします")
     elif failed_requests_list:
         logger.info(f"=====失敗したリクエスト {len(failed_requests_list)}件を再チェックします=====")
-        # 最新のEbayApiインスタンスを使用
-        retry_result = retry_failed_requests(failed_requests_list, ritz_ebay_api_ref[0], judgment_word)
+        retry_result = retry_failed_requests(failed_requests_list, judgment_word)
         logger.info(f"再チェック結果: 復元={retry_result['restored']}件, 失敗継続={retry_result['still_failed']}件")
 
         # 再チェックで成功したアイテム（在庫を1に戻した）をno_stock_listから除外
