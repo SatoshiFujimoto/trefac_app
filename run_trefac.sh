@@ -16,6 +16,9 @@ PY="$APP_DIR/venv/bin/python3"
 
 echo "===== $(date '+%F %T') run_trefac start ====="
 
+# 0) 開始の心拍: 司令塔(fleet表)へ自己登録。失敗してもcron本処理は止めない。
+"$PY" fleet_report.py trefac || echo "[run_trefac] 開始心拍に失敗（続行）"
+
 # 1) 最新CSVを取得（DL失敗でもキャッシュがあれば fetch_input.py が0で継続を選ぶ）
 "$PY" fetch_input.py
 fetch_rc=$?

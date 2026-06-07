@@ -12,6 +12,8 @@ config.ini に [ctrl] セクションを追加して使う:
 """
 import configparser
 import os
+import socket
+import sys
 from logging import getLogger
 
 import requests
@@ -92,3 +94,54 @@ def fetch_crawl(job_type: str = "trefac") -> list:
     resp.raise_for_status()
     data = resp.json()
     return [{"仕入れURL": it["url"], "eBay Item Number": it["item_num"]} for it in data.get("items", [])]
+
+
+def _local_ip() -> str:
+    """ベストエフォートで自機のVPC内IPを得る（取得失敗は空文字・送信はしない）。"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("10.104.0.5", 80))  # ctrl-01のVPC内IP宛て（UDPなので実送信なし）
+            return s.getsockname()[0]
+        finally:
+            s.close()
+    except OSError:
+        return ""
+
+
+def report_start(role: str, server_id: str | None = None) -> bool:
+    """cron開始時に司令塔へ自己登録（生存報告）。fleet 表に upsert される。
+
+    /register は upsert（行が無ければ作成・あれば last_heartbeat=now() に更新）なので、
+    「開始の確認＝最終起動時刻」がそのまま fleet で見える。失敗してもワーカー本処理は止めない。
+    server_id 省略時は hostname（例: yahoo-inv-01）。role は trefac/furima/hiro 等。
+    """
+    conf = _conf()
+    base = conf.get("base_url", "").rstrip("/")
+    token = conf.get("worker_token", "")
+    timeout = conf.getint("timeout", fallback=15)
+    if not base or not token:
+        logger.error("config.ini [ctrl] の base_url / worker_token が未設定です")
+        return False
+    sid = server_id or f"{socket.gethostname()}/{role}"
+    payload = {"server_id": sid, "role": role, "ip": _local_ip()}
+    try:
+        resp = _session.post(
+            f"{base}/register",
+            json=payload,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        return bool(resp.json().get("ok"))
+    except requests.RequestException as exc:
+        logger.error("開始報告(/register)に失敗 server=%s role=%s: %s", sid, role, exc)
+        return False
+
+
+if __name__ == "__main__":
+    # 起動スクリプトから `python fleet_report.py <role>` で呼ぶ用（開始の心拍）。
+    _role = sys.argv[1] if len(sys.argv) > 1 else "worker"
+    ok = report_start(_role)
+    print(f"report_start role={_role} -> {ok}")
+    sys.exit(0 if ok else 1)
