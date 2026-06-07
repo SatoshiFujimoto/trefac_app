@@ -68,3 +68,27 @@ def report_stock(item_num, in_stock: bool, account: str | None = None) -> bool:
     except requests.RequestException as exc:
         logger.error("在庫報告に失敗 item=%s in_stock=%s account=%s: %s", item_num, in_stock, acct, exc)
         return False
+
+
+def fetch_crawl(job_type: str = "trefac") -> list:
+    """司令塔(ctrl-01)から巡回対象を取得する（DB主導巡回）。
+
+    返り値は aki_requests がそのまま使える形式:
+      [{"仕入れURL": <url>, "eBay Item Number": <item_num>}, ...]
+    司令塔は active かつ在庫品/Revise済を除いた対象だけを返す（売り切れたら巡回しない）。
+    """
+    conf = _conf()
+    base = conf.get("base_url", "").rstrip("/")
+    token = conf.get("worker_token", "")
+    timeout = conf.getint("timeout", fallback=15)
+    if not base or not token:
+        raise RuntimeError("config.ini [ctrl] の base_url / worker_token が未設定です")
+    resp = _session.get(
+        f"{base}/crawl",
+        params={"type": job_type},
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=max(timeout, 60),  # 全件取得のため余裕を持たせる
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return [{"仕入れURL": it["url"], "eBay Item Number": it["item_num"]} for it in data.get("items", [])]

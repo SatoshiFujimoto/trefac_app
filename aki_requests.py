@@ -23,7 +23,8 @@ from ebay_pkg.trading import EbayApi
 
 from utils.MailSender import MailSender
 # 在庫報告は司令塔(ctrl-01)へ。eBayは司令塔が一括反映する（方式A・設計書§11.2）。
-from fleet_report import report_stock
+# 巡回対象も司令塔(items DB)から取得（DB主導巡回。売り切れたら次から巡回しない）。
+from fleet_report import report_stock, fetch_crawl
 
 # logger
 logger = getLogger(__name__)
@@ -799,21 +800,16 @@ def main() -> None:
     failed_requests_list = []  # タイムアウトや接続エラーで失敗したアイテムを保存
     blocked = False  # ブロック検出で中断したか（中断時もここまでの部分結果を保存する）
 
-    # ファイルの読み込み
-    file_list = glob.glob(input_file_pattern)
-    if not file_list:
-        logger.error(f'{input_file_pattern}ファイルがありません。')
-        return
-    file_path = file_list[0]
-    logger.info(f'読み込むファイル: {file_path}')
-
+    # 巡回対象は司令塔(ctrl-01のitems DB)から取得（CSV廃止・DB主導巡回）。
+    # 司令塔が active かつ在庫品/Revise済を除いた対象だけを返す＝売り切れたら次から巡回しない。
     try:
-        search_items = csv_to_dict(file_path)
-    except (FileNotFoundError, csv.Error) as e:
-        logger.error(f'CSVファイルの読み込みに失敗しました: {e}')
-        return
+        search_items = fetch_crawl("trefac")
+        logger.info(f'司令塔から巡回対象 {len(search_items)} 件を取得しました')
     except Exception as e:
-        logger.error(f'予期しないエラーが発生しました: {e}')
+        logger.error(f'司令塔からの巡回対象取得に失敗しました（今回はスキップ）: {e}')
+        return
+    if not search_items:
+        logger.warning('巡回対象が0件のため終了します')
         return
     # シャーディング: 複数サーバー構成のとき、このサーバーの担当分だけに絞る
     if app_settings.shard_count > 1:
