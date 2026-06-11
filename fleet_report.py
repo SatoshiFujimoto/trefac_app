@@ -14,6 +14,7 @@ import configparser
 import os
 import socket
 import sys
+import time
 from logging import getLogger
 
 import requests
@@ -51,6 +52,7 @@ def report_stock(item_num, in_stock: bool, account: str | None = None) -> bool:
     base = conf.get("base_url", "").rstrip("/")
     token = conf.get("worker_token", "")
     timeout = conf.getint("timeout", fallback=15)
+    attempts = max(1, conf.getint("report_attempts", fallback=3))  # 司令塔への報告 再送回数
     acct = account or conf.get("account", fallback=None) or None
     if not base or not token:
         logger.error("config.ini [ctrl] の base_url / worker_token が未設定です")
@@ -58,18 +60,32 @@ def report_stock(item_num, in_stock: bool, account: str | None = None) -> bool:
     payload = {"item_num": str(item_num), "in_stock": bool(in_stock)}
     if acct:
         payload["account"] = acct
-    try:
-        resp = _session.post(
-            f"{base}/stock",
-            json=payload,
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=timeout,
-        )
-        resp.raise_for_status()
-        return bool(resp.json().get("ok"))
-    except requests.RequestException as exc:
-        logger.error("在庫報告に失敗 item=%s in_stock=%s account=%s: %s", item_num, in_stock, acct, exc)
-        return False
+    # 司令塔への報告は一過性の失敗(ネット/タイムアウト/一時的5xx)があり得るため数回再送。
+    # 全部失敗したときだけ False を返す＝呼び出し側がLINE通知する（eBayへは司令塔が後で1回反映）。
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = _session.post(
+                f"{base}/stock",
+                json=payload,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            return bool(resp.json().get("ok"))
+        except requests.RequestException as exc:
+            last_exc = exc
+            logger.warning(
+                "在庫報告に失敗(%d/%d) item=%s in_stock=%s account=%s: %s",
+                attempt, attempts, item_num, in_stock, acct, exc,
+            )
+            if attempt < attempts:
+                time.sleep(min(2 ** (attempt - 1), 10))  # 指数バックオフ 1s,2s,4s…上限10s
+    logger.error(
+        "在庫報告に最終失敗(%d回) item=%s in_stock=%s account=%s: %s",
+        attempts, item_num, in_stock, acct, last_exc,
+    )
+    return False
 
 
 def fetch_crawl(job_type: str = "trefac") -> list:
