@@ -52,7 +52,9 @@ def report_stock(item_num, in_stock: bool, account: str | None = None) -> bool:
     base = conf.get("base_url", "").rstrip("/")
     token = conf.get("worker_token", "")
     timeout = conf.getint("timeout", fallback=15)
-    attempts = max(1, conf.getint("report_attempts", fallback=3))  # 司令塔への報告 再送回数
+    attempts = max(1, conf.getint("report_attempts", fallback=5))  # 司令塔への報告 再送回数
+    # 既定5回。バックオフ 1+2+4+8=15s 粘る＝司令塔の再起動窓(~6s)をまたいで成功させる
+    # （3回=3sでは再起動デプロイ中の報告が取りこぼされLINE誤通知になっていた）。
     acct = account or conf.get("account", fallback=None) or None
     if not base or not token:
         logger.error("config.ini [ctrl] の base_url / worker_token が未設定です")
