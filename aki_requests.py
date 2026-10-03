@@ -367,6 +367,18 @@ def line_notify(message: str) -> None:
     # 結果出力
     logger.info(f'line通知結果：{response.status_code}')
 
+# 仕入元に繋がらず在庫を判定できなかった結果（send_request の戻り値）→ 表示名。
+# これらは在庫0にしない（DNS障害等で大量の偽の在庫0を出さない・2026-10-02の事故対策）。
+COMM_ERRORS = {
+    "timeout": "タイムアウト",
+    "connection_error": "接続エラー",
+    "server_error": "サーバーエラー",
+    "short_response": "レスポンス異常",
+}
+# 巡回の最後に繋がらなかった分を再チェックする前の待ち時間（一過性の瞬断が明けるのを待つ）。
+RETRY_WAIT_SEC = 60
+
+
 def send_request(
     request_url: str,
     judgment_word: Optional[str] = None,
@@ -570,57 +582,63 @@ def retry_failed_requests(
     if timeout is None:
         timeout = app_settings.request_timeout
 
-    logger.info(f"=====失敗したアイテムの再チェック開始: {len(failed_items)}件=====")
+    logger.info(f"=====失敗したアイテムの再チェック開始: {len(failed_items)}件"
+                f"（{RETRY_WAIT_SEC}秒待ってから）=====")
+    sleep(RETRY_WAIT_SEC)  # 一過性の障害(DNS/回線の瞬断)が明けるのを少し待つ
     restored_count = 0
     still_failed_count = 0
     restored_items = []
-    failed_items_list = []  # 再チェックでも失敗したアイテムのリスト
+    failed_items_list = []  # 再チェックでも繋がらず「判定不能」を報告したアイテム
+    no_stock_items = []     # 再チェックで正常に「在庫なし」と判定できたアイテム
 
     for idx, item in enumerate(failed_items, 1):
         url = item["url"]
         item_num = item["item_num"]
         logger.info(f"再チェック {idx}/{len(failed_items)}: {url}")
 
-        # 再チェック（リトライなしで1回だけ試行）
-        is_stock = send_request(url, judgment_word, timeout=timeout, max_retries=1)
+        is_stock = send_request(url, judgment_word, timeout=timeout, max_retries=2)
 
-        if is_stock is True:
-            # 在庫ありを確認できた場合、司令塔へ「在庫あり」を報告（→eBayで1に戻る）
+        if is_stock == "blocked":
+            # ブロックの兆候＝これ以上 trefac へアクセスしない。残りは報告せず次回の巡回へ持ち越し。
+            stop_event.set()
+            logger.error(f"再チェック中にブロック検出: 残り{len(failed_items) - idx + 1}件は次回へ持ち越し")
+            break
+        elif is_stock is True:
+            # 繋がって在庫あり＝在庫は変えない。保留中(recheck)だった商品だけ解除/復旧を報告する
+            # （保留していない商品に「在庫あり」を送ると無駄なRevise(在庫1→1)が積まれるため）。
             logger.info(f"再チェックで在庫ありを確認: {url} - {item_num}")
-            ok = report_stock(item_num, True)
-            if ok:
-                restored_count += 1
-                restored_items.append(item_num)
-                logger.info(f"在庫ありを司令塔へ報告しました: {item_num} - {url}")
-            else:
-                logger.warning(f"在庫ありの報告に失敗しました: {item_num}")
-                still_failed_count += 1
-                failed_items_list.append(item_num)
-        elif is_stock in ("timeout", "connection_error", "server_error", "short_response"):
-            # まだタイムアウトや接続エラー、サーバーエラー、レスポンス異常の場合
+            if item.get("recheck"):
+                if report_stock(item_num, True):
+                    restored_count += 1
+                    restored_items.append(item_num)
+                else:
+                    logger.warning(f"在庫ありの報告に失敗しました: {item_num}")
+        elif is_stock in COMM_ERRORS:
+            # それでも繋がらない＝「判定不能」を報告。司令塔が保留し、猶予を超えて続けば安全のため0にする。
             still_failed_count += 1
             failed_items_list.append(item_num)
-            error_type_name = {
-                "timeout": "タイムアウト",
-                "connection_error": "接続エラー",
-                "server_error": "サーバーエラー",
-                "short_response": "レスポンス異常"
-            }.get(is_stock, is_stock)
-            logger.warning(f"再チェックでも失敗 ({error_type_name}): {url}")
+            ok = report_stock(item_num, False, reason="comm_error")
+            logger.warning(f"再チェックでも失敗 ({COMM_ERRORS[is_stock]}): {url} - 判定不能を司令塔へ"
+                           f"{'報告(保留)' if ok else '報告できず'}")
         else:
-            # 在庫なしの場合
-            still_failed_count += 1
-            failed_items_list.append(item_num)
-            logger.info(f"再チェックでも在庫なし: {url}")
+            # 正常に取得できて在庫なし＝本当の売り切れ → 在庫0を報告
+            if report_stock(item_num, False):
+                no_stock_items.append(item_num)
+                logger.info(f"再チェックで在庫なし 在庫0を司令塔へ報告: {url}\nhttps://www.ebay.com/itm/{item_num}")
+            else:
+                no_stock_items.append(f" Error 在庫なし 司令塔への報告に失敗しました。\n{url}\nhttps://www.ebay.com/itm/{item_num}")
+                logger.error(f"再チェックで在庫なし: 司令塔への報告に失敗: {item_num}")
 
         # サーバー負荷を考慮して少し待機
         sleep(app_settings.retry_check_interval)
 
-    logger.info(f"=====再チェック完了: 復元={restored_count}件, 失敗継続={still_failed_count}件=====")
+    logger.info(f"=====再チェック完了: 保留解除={restored_count}件, 在庫なし={len(no_stock_items)}件, "
+                f"判定不能(保留)={still_failed_count}件=====")
     if restored_items:
-        logger.info(f"復元したアイテム番号: {restored_items}")
+        logger.info(f"保留解除したアイテム番号: {restored_items}")
 
-    return {"restored": restored_count, "still_failed": still_failed_count, "failed_items": failed_items_list, "restored_items": restored_items}
+    return {"restored": restored_count, "still_failed": still_failed_count, "failed_items": failed_items_list,
+            "restored_items": restored_items, "no_stock_items": no_stock_items}
 
 
 def check_single_item(
@@ -716,30 +734,22 @@ def check_single_item(
         return result
     elif is_stock is True:
         # 在庫ありの場合（判定文字列がページに含まれている）
-        # 在庫は既に1になっている想定のため、更新は不要
-        with result_lock:
-            logger.info(f"{index}/{total} OK: {url}")
-    elif is_stock in ("timeout", "connection_error", "server_error", "short_response"):
-        # リトライ上限に達した場合、一旦在庫を0にして後で再チェック
-        error_type_name = {
-            "timeout": "タイムアウト",
-            "connection_error": "接続エラー",
-            "server_error": "サーバーエラー",
-            "short_response": "レスポンス異常"
-        }.get(is_stock, is_stock)
-        with result_lock:
-            logger.warning(f"{index}/{total} リクエスト失敗 ({error_type_name}): {url} - 一旦在庫を0にして後で再チェックします")
-
-        # 安全のため一旦「在庫なし」を司令塔へ報告（→eBayで0になる）。後で再チェック対象。
-        ok = report_stock(item_num, False)
-        result["failed_request"] = {"url": url, "item_num": item_num}
-        if ok:
+        # 通常は在庫1のままなので更新不要。通信エラー保留中(recheck)の商品だけは
+        # 「在庫あり」を報告して保留を解除する（猶予切れで0にしていた場合はここで1に戻る）。
+        if item.get("recheck"):
+            ok = report_stock(item_num, True)
             with result_lock:
-                logger.info(f"{index}/{total} リクエスト失敗のため在庫0を司令塔へ報告: {item_num}")
-            result["no_stock_item"] = item_num
+                logger.info(f"{index}/{total} OK(保留解除{'を報告' if ok else 'の報告に失敗'}): {url}")
         else:
             with result_lock:
-                logger.warning(f"{index}/{total} リクエスト失敗: 在庫0の報告に失敗: {item_num}")
+                logger.info(f"{index}/{total} OK: {url}")
+    elif is_stock in COMM_ERRORS:
+        # 仕入元に繋がらず判定不能（DNS障害/接続/タイムアウト/5xx/応答異常）。
+        # ここでは在庫0にしない（障害時に大量の偽の在庫0を出さない）。巡回の最後に再チェックし、
+        # それでも繋がらなければ司令塔へ「判定不能」を報告→司令塔が保留・猶予超えで安全のため0。
+        with result_lock:
+            logger.warning(f"{index}/{total} リクエスト失敗 ({COMM_ERRORS[is_stock]}): {url} - 在庫は変えず最後に再チェックします")
+        result["failed_request"] = {"url": url, "item_num": item_num, "recheck": bool(item.get("recheck"))}
     else:
         # 在庫なしの場合（正常にページ取得できたが在庫なし）→ 司令塔へ報告（→eBayで0）
         ok = report_stock(item_num, False)
@@ -905,17 +915,10 @@ def main() -> None:
     elif failed_requests_list:
         logger.info(f"=====失敗したリクエスト {len(failed_requests_list)}件を再チェックします=====")
         retry_result = retry_failed_requests(failed_requests_list, judgment_word)
-        logger.info(f"再チェック結果: 復元={retry_result['restored']}件, 失敗継続={retry_result['still_failed']}件")
-
-        # 再チェックで成功したアイテム（在庫を1に戻した）をno_stock_listから除外
-        if retry_result.get('restored_items'):
-            restored_items = retry_result['restored_items']
-            # 文字列と数値の両方に対応するため、文字列に変換して比較
-            no_stock_list = [item for item in no_stock_list if str(item) not in [str(ri) for ri in restored_items]]
-            logger.info(f"再チェックで復元したアイテム {len(restored_items)}件をno_stock_listから除外しました")
-
-        # 再チェックでも失敗したアイテムは既にno_stock_listに含まれているので追加不要
-        # （タイムアウト/接続エラー時に既に追加済み）
+        logger.info(f"再チェック結果: 保留解除={retry_result['restored']}件, "
+                    f"在庫なし={len(retry_result['no_stock_items'])}件, 判定不能(保留)={retry_result['still_failed']}件")
+        # 再チェックで正常に在庫なしと判定できた分だけ在庫変更に数える（判定不能は在庫を変えていない）
+        no_stock_list.extend(retry_result['no_stock_items'])
     else:
         logger.info("再チェックが必要なリクエストはありませんでした")
 
@@ -936,7 +939,12 @@ def main() -> None:
             "（未チェック分は次回以降に持ち越し）。"
         )
     if retry_result:
-        mail_text += f"\n失敗したリクエスト {len(failed_requests_list)}件を再チェックし、{retry_result['restored']}件を復元しました。"
+        mail_text += (
+            f"\n繋がらなかった {len(failed_requests_list)}件を再チェック: "
+            f"在庫なし {len(retry_result['no_stock_items'])}件 / "
+            f"判定不能 {retry_result['still_failed']}件（在庫は変えず司令塔で保留。"
+            f"続けば司令塔が安全のため0にする）"
+        )
 
     try:
         mail_sender.send_mail_with_file_to_fujiken36(run_subject, mail_text, requests_file_path)

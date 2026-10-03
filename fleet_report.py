@@ -40,11 +40,14 @@ def _conf() -> configparser.SectionProxy:
     return _cfg
 
 
-def report_stock(item_num, in_stock: bool, account: str | None = None) -> bool:
+def report_stock(item_num, in_stock: bool, account: str | None = None,
+                 reason: str | None = None) -> bool:
     """在庫あり/なしを司令塔へ報告。司令塔が受理(キュー投入)できたら True。
 
     account 省略時は config.ini [ctrl] account を使う（ワーカーアプリ単位で固定するのが基本。
     例: trefac ワーカー → account=ritz）。どちらも無ければ送らず司令塔の既定に委ねる。
+    reason='comm_error' は「仕入元に繋がらず判定不能」。司令塔は即0にせず保留し、
+    保留が猶予を超えて続いたときだけ安全のため0にする（DNS障害等での偽の在庫0防止）。
     司令塔は jobs(type='ebay_apply') に積むだけで即返るため、この呼び出しは軽量。
     実反映の成否はこの時点では分からない（司令塔側で非同期に反映・リトライ）。
     """
@@ -62,6 +65,8 @@ def report_stock(item_num, in_stock: bool, account: str | None = None) -> bool:
     payload = {"item_num": str(item_num), "in_stock": bool(in_stock)}
     if acct:
         payload["account"] = acct
+    if reason:
+        payload["reason"] = reason
     # 司令塔への報告は一過性の失敗(ネット/タイムアウト/一時的5xx)があり得るため数回再送。
     # 全部失敗したときだけ False を返す＝呼び出し側がLINE通知する（eBayへは司令塔が後で1回反映）。
     last_exc: Exception | None = None
@@ -96,6 +101,7 @@ def fetch_crawl(job_type: str = "trefac") -> list:
     返り値は aki_requests がそのまま使える形式:
       [{"仕入れURL": <url>, "eBay Item Number": <item_num>}, ...]
     司令塔は active かつ在庫品/Revise済を除いた対象だけを返す（売り切れたら巡回しない）。
+    例外: 通信エラー保留中の商品は out_of_stock でも返る（recheck=True）。
     """
     conf = _conf()
     base = conf.get("base_url", "").rstrip("/")
@@ -111,7 +117,9 @@ def fetch_crawl(job_type: str = "trefac") -> list:
     )
     resp.raise_for_status()
     data = resp.json()
-    return [{"仕入れURL": it["url"], "eBay Item Number": it["item_num"]} for it in data.get("items", [])]
+    # recheck=true は通信エラー保留中の商品（out_of_stock を含む）。在庫ありでも報告して解除/復旧させる。
+    return [{"仕入れURL": it["url"], "eBay Item Number": it["item_num"], "recheck": bool(it.get("recheck"))}
+            for it in data.get("items", [])]
 
 
 def _local_ip() -> str:
