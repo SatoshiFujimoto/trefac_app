@@ -138,23 +138,34 @@ def report_start(role: str, server_id: str | None = None) -> bool:
     base = conf.get("base_url", "").rstrip("/")
     token = conf.get("worker_token", "")
     timeout = conf.getint("timeout", fallback=15)
+    attempts = max(1, conf.getint("report_attempts", fallback=5))  # 在庫報告と同じ再送回数
+    # 心拍も指数バックオフで最大5回(1+2+4+8=15s)再送＝司令塔の再起動窓・一過性502をまたいで成功させる
+    # （従来は1回のみ＝再起動ドレイン中の心拍が取りこぼされ fleet が古いまま＝偽の⛔になっていた）。
     if not base or not token:
         logger.error("config.ini [ctrl] の base_url / worker_token が未設定です")
         return False
     sid = server_id or f"{socket.gethostname()}/{role}"
     payload = {"server_id": sid, "role": role, "ip": _local_ip()}
-    try:
-        resp = _session.post(
-            f"{base}/register",
-            json=payload,
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=timeout,
-        )
-        resp.raise_for_status()
-        return bool(resp.json().get("ok"))
-    except requests.RequestException as exc:
-        logger.error("開始報告(/register)に失敗 server=%s role=%s: %s", sid, role, exc)
-        return False
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = _session.post(
+                f"{base}/register",
+                json=payload,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            return bool(resp.json().get("ok"))
+        except requests.RequestException as exc:
+            last_exc = exc
+            logger.warning("開始報告(/register)に失敗(%d/%d) server=%s role=%s: %s",
+                           attempt, attempts, sid, role, exc)
+            if attempt < attempts:
+                time.sleep(min(2 ** (attempt - 1), 10))  # 指数バックオフ 1s,2s,4s,8s…上限10s
+    logger.error("開始報告(/register)に最終失敗(%d回) server=%s role=%s: %s",
+                 attempts, sid, role, last_exc)
+    return False
 
 
 if __name__ == "__main__":
