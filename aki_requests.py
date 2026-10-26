@@ -13,6 +13,7 @@ from datetime import datetime
 from time import sleep
 from typing import List, Dict, Optional, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 from threading import Lock, Event
 import requests
 from logging import getLogger, config as logging_config
@@ -183,6 +184,11 @@ class AppSettings:
             self.rest_minutes = float(settings.get('rest_minutes', '0'))
             self.block_probes = int(settings.get('block_probes', '0'))
             self.block_probe_wait_min = float(settings.get('block_probe_wait_min', '10'))
+            # 出口IPの交代（2026-10-26: trefacはIPごとに連続約45分で429）。1台に複数IPを持たせ、
+            # ip_switch_minutes ごと／429が来た時に次のIPへ切り替える。未設定なら従来どおり既定の出口。
+            # trefacへのアクセスだけに使う（司令塔への報告・メルカリ/フリマは既定の出口のまま）。
+            self.source_ips = [s.strip() for s in settings.get('source_ips', '').split(',') if s.strip()]
+            self.ip_switch_minutes = float(settings.get('ip_switch_minutes', '0'))
 
             # ファイル設定
             self.input_file_pattern = settings['input_file_pattern']
@@ -288,6 +294,71 @@ def _maybe_rest() -> None:
         sleep(app_settings.rest_minutes * 60)
         _work_started = time.monotonic()
         logger.info(f'[試験] 休憩明け・再開します（開始から{_elapsed_min():.1f}分）')
+
+
+class _SourceIPAdapter(requests.adapters.HTTPAdapter):
+    """出口(送信元)IPを固定するアダプタ。"""
+
+    def __init__(self, source_ip: str, **kwargs):
+        self._source_ip = source_ip
+        super().__init__(**kwargs)
+
+    def init_poolmanager(self, *args, **kwargs):
+        kwargs['source_address'] = (self._source_ip, 0)
+        return super().init_poolmanager(*args, **kwargs)
+
+
+_ip_lock = Lock()
+_ip_index = 0
+_ip_started = time.monotonic()
+
+
+def _current_ip() -> str | None:
+    """今使う出口IP。ip_switch_minutes を超えたら次のIPへ（最後のIPに来たらそのまま）。"""
+    global _ip_index, _ip_started
+    ips = app_settings.source_ips
+    if not ips:
+        return None
+    with _ip_lock:
+        if (app_settings.ip_switch_minutes > 0 and _ip_index < len(ips) - 1
+                and _elapsed_min(_ip_started) >= app_settings.ip_switch_minutes):
+            _ip_index += 1
+            _ip_started = time.monotonic()
+            logger.info(f'[IP交代] {app_settings.ip_switch_minutes:g}分たったので出口IPを {ips[_ip_index]} に切り替えます'
+                        f'（開始から{_elapsed_min():.1f}分）')
+        return ips[_ip_index]
+
+
+def _switch_ip_on_block(blocked_ip: str | None) -> bool:
+    """429が来たら、まだ使っていない次のIPへ切り替える。切り替えられたら True。"""
+    global _ip_index, _ip_started
+    ips = app_settings.source_ips
+    with _ip_lock:
+        if blocked_ip is not None and ips and ips[_ip_index] != blocked_ip:
+            return True  # 他スレッドが既に切り替え済み
+        if not ips or _ip_index >= len(ips) - 1:
+            return False
+        _ip_index += 1
+        _ip_started = time.monotonic()
+        logger.warning(f'[IP交代] {blocked_ip} で429 → 出口IPを {ips[_ip_index]} に切り替えて続けます'
+                       f'（開始から{_elapsed_min():.1f}分）')
+        return True
+
+
+_thread_ip = threading.local()  # このスレッドが直前に使った出口IP（429の切り替え判定用）
+
+
+def _http_get(url: str, headers: dict, timeout):
+    """trefacへのGET。source_ips 設定時はその出口IPから出す（Cookieは持ち越さない＝従来と同じ）。"""
+    ip = _current_ip()
+    _thread_ip.ip = ip
+    if ip is None:
+        return requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+    with requests.Session() as s:
+        adapter = _SourceIPAdapter(ip)
+        s.mount('http://', adapter)
+        s.mount('https://', adapter)
+        return s.get(url, headers=headers, timeout=timeout, allow_redirects=True)
 
 
 def _probe_after_block(url: str, judgment_word: str):
@@ -486,12 +557,7 @@ def send_request(
             selected_user_agent = random.choice(app_settings.user_agents_list)
             headers = {'User-Agent': selected_user_agent}
 
-            res = requests.get(
-                request_url,
-                headers=headers,
-                timeout=timeout,
-                allow_redirects=True
-            )
+            res = _http_get(request_url, headers, timeout)
 
             # エンコーディング処理
             # requestsが自動推測したエンコーディングを使用し、エラー時はUTF-8でフォールバック
@@ -571,7 +637,7 @@ def send_request(
                 if res.status_code in (403, 429):
                     logger.error(
                         f"ブロックの兆候を検出: ステータスコード {res.status_code} ({status_msg})"
-                        f"（開始から{_elapsed_min():.1f}分）: {request_url}"
+                        f"（開始から{_elapsed_min():.1f}分・出口IP {getattr(_thread_ip, 'ip', None) or '既定'}）: {request_url}"
                     )
                     # 制限の仕組みを切り分けるため、応答ヘッダーと本文の先頭を残す（2026-10-26）
                     logger.error(f"  429応答ヘッダー: {dict(res.headers)}")
@@ -774,6 +840,10 @@ def check_single_item(
     is_stock = send_request(url, judgment_word)
 
     # 429後に待って再試行する（試験用・既定は無効＝従来どおり即停止）
+    # 429なら、まだ使っていない出口IPへ切り替えて同じ商品をやり直す（source_ips 設定時のみ）
+    if is_stock == "blocked" and _switch_ip_on_block(getattr(_thread_ip, 'ip', None)):
+        is_stock = send_request(url, judgment_word)
+
     if is_stock == "blocked" and app_settings.block_probes > 0:
         is_stock = _probe_after_block(url, judgment_word)
 
