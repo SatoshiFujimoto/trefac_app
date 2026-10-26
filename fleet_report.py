@@ -176,6 +176,41 @@ def report_start(role: str, server_id: str | None = None) -> bool:
     return False
 
 
+def report_cron_beat(role: str, status: str = "ok", note: str = "") -> bool:
+    """巡回の完走/異常を司令塔の /cron-beat へ報告する（沈黙を検知するための心拍）。
+
+    司令塔 cron_registry の登録キーと綴りが1文字でもズレると心拍が迷子になるため、
+    呼び出し側にキー文字列を書かせず、ここで `{role}_worker:{hostname}` を組み立てる。
+    role は trefac / furima / hiro。hostname は monitor-01..09 / monitor-hiro。
+
+    status に 'ok' 以外(blocked/failed)を渡すと司令塔が Pushover urgent まで出す
+    （blocked は「正常→ブロック」に変わった回だけ）。サマリーメールが死んでも沈黙に
+    気づけるようにするのが目的なので、報告に失敗しても本処理は止めない。
+    ※2026-10-03の正本配布でこの関数が消え、ブロック途中停止に3週間気づけなかった。消すな。
+    """
+    conf = _conf()
+    base = conf.get("base_url", "").rstrip("/")
+    token = conf.get("worker_token", "")
+    timeout = conf.getint("timeout", fallback=15)
+    if not base or not token:
+        logger.error("config.ini [ctrl] の base_url / worker_token が未設定です")
+        return False
+    job = f"{role}_worker:{socket.gethostname()}"
+    payload = {"job": job, "status": status, "note": note[:300]}
+    try:
+        resp = _session.post(
+            f"{base}/cron-beat",
+            json=payload,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        return bool(resp.json().get("ok"))
+    except requests.RequestException as exc:
+        logger.warning("完走報告(/cron-beat)に失敗 job=%s status=%s: %s", job, status, exc)
+        return False
+
+
 if __name__ == "__main__":
     # 起動スクリプトから `python fleet_report.py <role>` で呼ぶ用（開始の心拍）。
     _role = sys.argv[1] if len(sys.argv) > 1 else "worker"

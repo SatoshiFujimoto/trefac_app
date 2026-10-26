@@ -24,7 +24,7 @@ from ebay_pkg.trading import EbayApi
 from utils.MailSender import MailSender
 # 在庫報告は司令塔(ctrl-01)へ。eBayは司令塔が一括反映する（方式A・設計書§11.2）。
 # 巡回対象も司令塔(items DB)から取得（DB主導巡回。売り切れたら次から巡回しない）。
-from fleet_report import report_stock, fetch_crawl
+from fleet_report import report_stock, fetch_crawl, report_cron_beat
 
 # logger
 logger = getLogger(__name__)
@@ -809,6 +809,7 @@ def main() -> None:
     no_stock_list = []
     failed_requests_list = []  # タイムアウトや接続エラーで失敗したアイテムを保存
     blocked = False  # ブロック検出で中断したか（中断時もここまでの部分結果を保存する）
+    stopped_at = 0  # ブロック中断した時点の完了件数（司令塔への完走報告に載せる）
 
     # 巡回対象は司令塔(ctrl-01のitems DB)から取得（CSV廃止・DB主導巡回）。
     # 司令塔が active かつ在庫品/Revise済を除いた対象だけを返す＝売り切れたら次から巡回しない。
@@ -888,6 +889,7 @@ def main() -> None:
                         # 全ワーカーに停止を通知（実行中のスレッドも次のアイテムをスキップする）
                         stop_event.set()
                         blocked = True
+                        stopped_at = completed_count
                         logger.error(f"{result['index']}/{all_list} ブロック検出: 全ワーカーを停止します（ここまでの結果は保存します）")
                         # まだ開始していないタスクをキャンセル
                         for f in futures:
@@ -950,6 +952,12 @@ def main() -> None:
         mail_sender.send_mail_with_file_to_fujiken36(run_subject, mail_text, requests_file_path)
     except Exception as e:
         logger.error(f'メール送信に失敗しました: {e}')
+
+    # 司令塔へ完走報告（/opsの心拍＋ブロック中断の通知。メールが死んでも気づけるように）
+    beat_note = f"在庫変更{len(no_stock_list)}件 / 担当{all_list}件"
+    if blocked:
+        beat_note += f" / ブロック検出で{stopped_at}件目に中断（残り{all_list - stopped_at}件は未チェック）"
+    report_cron_beat("trefac", "blocked" if blocked else "ok", beat_note)
 
     logger.info('=====main_program is end=====')
 
