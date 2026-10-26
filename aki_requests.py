@@ -191,6 +191,9 @@ class AppSettings:
             # trefacへのアクセスだけに使う（司令塔への報告・メルカリ/フリマは既定の出口のまま）。
             self.source_ips = [s.strip() for s in settings.get('source_ips', '').split(',') if s.strip()]
             self.ip_switch_minutes = float(settings.get('ip_switch_minutes', '0'))
+            # 臨時の追いつき巡回用: 司令塔の /crawl の代わりにこのJSON([{url,item_num},...])を回す。
+            # 未設定なら従来どおり /crawl（2026-10-26 長期未巡回の約3,300件を臨時サーバーで一掃した時に追加）
+            self.crawl_list_file = settings.get('crawl_list_file', '').strip()
 
             # ファイル設定
             self.input_file_pattern = settings['input_file_pattern']
@@ -961,8 +964,14 @@ def main() -> None:
     # 巡回対象は司令塔(ctrl-01のitems DB)から取得（CSV廃止・DB主導巡回）。
     # 司令塔が active かつ在庫品/Revise済を除いた対象だけを返す＝売り切れたら次から巡回しない。
     try:
-        search_items = fetch_crawl("trefac")
-        logger.info(f'司令塔から巡回対象 {len(search_items)} 件を取得しました')
+        if app_settings.crawl_list_file:
+            with open(app_settings.crawl_list_file, encoding='utf-8') as f:
+                search_items = [{"仕入れURL": it["url"], "eBay Item Number": it["item_num"], "recheck": False}
+                                for it in json.load(f)]
+            logger.info(f'臨時リスト {app_settings.crawl_list_file} から巡回対象 {len(search_items)} 件を読みました')
+        else:
+            search_items = fetch_crawl("trefac")
+            logger.info(f'司令塔から巡回対象 {len(search_items)} 件を取得しました')
     except Exception as e:
         logger.error(f'司令塔からの巡回対象取得に失敗しました（今回はスキップ）: {e}')
         return
