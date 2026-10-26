@@ -280,6 +280,7 @@ _pace_lock = Lock()
 _run_started = time.monotonic()
 _work_started = _run_started
 _last_recover = 0.0
+_last_block = 0.0     # 最後に429/403を受けた時刻（締め出しは最後の429から60分で解ける＝待つ基準）
 
 
 def _elapsed_min(since: float | None = None) -> float:
@@ -367,32 +368,41 @@ def _http_get(url: str, headers: dict, timeout):
 
 
 def _probe_after_block(url: str, judgment_word: str):
-    """429/403 の後、block_probe_wait_min 待って同じURLを1件だけ試す。最大 block_probes 回。
+    """429/403 の後、最後の429から block_probe_wait_min 分待って同じURLを1件だけ試す。最大 block_probes 回。
 
+    締め出しは「最後に429を受けてから60分」で解ける（2026-10-27 monitor-04/06で確認）。
+    締め出し中に1件でも投げると延長されるので、待つ基準は最初でなく最後の429。
     回復したら結果をそのまま返して巡回を続ける。全部だめなら "blocked"（従来どおり停止）。
     """
     global _work_started, _last_recover
     with _pace_lock:
         if stop_event.is_set():
             return "blocked"
-        # 他スレッドが待って回復を確認した直後なら、待たずに1回だけ再試行
+        # 他スレッドが待って回復を確認した直後なら、まず1回だけ再試行（だめなら下で待ち直す）
         if time.monotonic() - _last_recover < 120:
-            return send_request(url, judgment_word)
-        waited = 0.0
-        for i in range(1, app_settings.block_probes + 1):
-            # 1回目だけ長く待てる（締め出しは少なくとも35分続くと分かっているため）
-            wait = app_settings.block_probe_first_wait_min if i == 1 else app_settings.block_probe_wait_min
-            logger.warning(f'[試験] 429後 {wait:g}分待って1件だけ試します'
-                           f'（{i}/{app_settings.block_probes}回目・開始から{_elapsed_min():.1f}分）: {url}')
-            sleep(wait * 60)
-            waited += wait
             result = send_request(url, judgment_word)
             if result != "blocked":
-                logger.warning(f'[試験] 回復: 429から{waited:g}分で通りました'
+                return result
+            logger.warning(f'[試験] 回復直後にまた429 → 最後の429から待ち直します: {url}')
+        for i in range(1, app_settings.block_probes + 1):
+            # 1回目だけ長く待てる（締め出しは最後の429から60分）
+            wait = app_settings.block_probe_first_wait_min if i == 1 else app_settings.block_probe_wait_min
+            logger.warning(f'[試験] 最後の429から {wait:g}分待って1件だけ試します'
+                           f'（{i}/{app_settings.block_probes}回目・開始から{_elapsed_min():.1f}分）: {url}')
+            while not stop_event.is_set():
+                left = _last_block + wait * 60 - time.monotonic()
+                if left <= 0:
+                    break
+                sleep(min(left, 60))
+            if stop_event.is_set():
+                return "blocked"
+            result = send_request(url, judgment_word)
+            if result != "blocked":
+                logger.warning(f'[試験] 回復: 最後の429から{wait:g}分で通りました'
                                f'（開始から{_elapsed_min():.1f}分）→ 巡回を再開します')
                 _last_recover = _work_started = time.monotonic()
                 return result
-            logger.warning(f'[試験] まだ429: 429から{waited:g}分経過')
+            logger.warning(f'[試験] まだ429（開始から{_elapsed_min():.1f}分）')
         return "blocked"
 
 
@@ -644,6 +654,8 @@ def send_request(
 
                 # 403（Forbidden）や429（Too Many Requests）エラーは即座に停止
                 if res.status_code in (403, 429):
+                    global _last_block
+                    _last_block = time.monotonic()
                     logger.error(
                         f"ブロックの兆候を検出: ステータスコード {res.status_code} ({status_msg})"
                         f"（開始から{_elapsed_min():.1f}分・出口IP {getattr(_thread_ip, 'ip', None) or '既定'}）: {request_url}"
