@@ -175,6 +175,15 @@ class AppSettings:
                     self.request_interval_max, self.request_interval_min
                 )
 
+            # 429切り分けの試験用（2026-10-26: monitor-01〜06が連続45分で必ず429になる件）。
+            # 既定0=従来どおり（休憩なし・429で即停止）。試験する台の config.ini だけで有効にする。
+            #   work_minutes/rest_minutes: 連続work分走ったらrest分休む（45分の前に休めばリセットされるか）
+            #   block_probes/block_probe_wait_min: 429後に wait分待って1件試す、をprobes回まで（何分で解けるか）
+            self.work_minutes = float(settings.get('work_minutes', '0'))
+            self.rest_minutes = float(settings.get('rest_minutes', '0'))
+            self.block_probes = int(settings.get('block_probes', '0'))
+            self.block_probe_wait_min = float(settings.get('block_probe_wait_min', '10'))
+
             # ファイル設定
             self.input_file_pattern = settings['input_file_pattern']
             self.output_file_name = settings['output_file_name']
@@ -253,6 +262,58 @@ max_workers = app_settings.max_workers
 # 403/429（ブロック）を検知したワーカーがこれをセットすると、
 # 他のワーカーはリクエスト送信前にスキップして処理を打ち切る
 stop_event = Event()
+
+# 休憩/429後の再試行（試験用・既定は無効）。_pace_lock を握って sleep する間、
+# もう一方のスレッドも次の商品の前で _pace_lock 待ちになる＝全体が止まって休める。
+_pace_lock = Lock()
+_run_started = time.monotonic()
+_work_started = _run_started
+_last_recover = 0.0
+
+
+def _elapsed_min(since: float | None = None) -> float:
+    return (time.monotonic() - (since if since is not None else _run_started)) / 60
+
+
+def _maybe_rest() -> None:
+    """連続 work_minutes 走ったら rest_minutes 休む（無効なら何もしない）。"""
+    global _work_started
+    if app_settings.work_minutes <= 0 or app_settings.rest_minutes <= 0:
+        return
+    with _pace_lock:
+        if stop_event.is_set() or _elapsed_min(_work_started) < app_settings.work_minutes:
+            return
+        logger.info(f'[試験] 連続{_elapsed_min(_work_started):.1f}分走ったので{app_settings.rest_minutes:g}分休みます'
+                    f'（開始から{_elapsed_min():.1f}分）')
+        sleep(app_settings.rest_minutes * 60)
+        _work_started = time.monotonic()
+        logger.info(f'[試験] 休憩明け・再開します（開始から{_elapsed_min():.1f}分）')
+
+
+def _probe_after_block(url: str, judgment_word: str):
+    """429/403 の後、block_probe_wait_min 待って同じURLを1件だけ試す。最大 block_probes 回。
+
+    回復したら結果をそのまま返して巡回を続ける。全部だめなら "blocked"（従来どおり停止）。
+    """
+    global _work_started, _last_recover
+    with _pace_lock:
+        if stop_event.is_set():
+            return "blocked"
+        # 他スレッドが待って回復を確認した直後なら、待たずに1回だけ再試行
+        if time.monotonic() - _last_recover < 120:
+            return send_request(url, judgment_word)
+        for i in range(1, app_settings.block_probes + 1):
+            logger.warning(f'[試験] 429後 {app_settings.block_probe_wait_min:g}分待って1件だけ試します'
+                           f'（{i}/{app_settings.block_probes}回目・開始から{_elapsed_min():.1f}分）: {url}')
+            sleep(app_settings.block_probe_wait_min * 60)
+            result = send_request(url, judgment_word)
+            if result != "blocked":
+                logger.warning(f'[試験] 回復: 429から{i * app_settings.block_probe_wait_min:g}分で通りました'
+                               f'（開始から{_elapsed_min():.1f}分）→ 巡回を再開します')
+                _last_recover = _work_started = time.monotonic()
+                return result
+            logger.warning(f'[試験] まだ429: 429から{i * app_settings.block_probe_wait_min:g}分経過')
+        return "blocked"
 
 
 def csv_to_dict(file_path: str) -> List[Dict[str, str]]:
@@ -509,9 +570,12 @@ def send_request(
                 # 403（Forbidden）や429（Too Many Requests）エラーは即座に停止
                 if res.status_code in (403, 429):
                     logger.error(
-                        f"ブロックの兆候を検出: ステータスコード {res.status_code} ({status_msg})\n"
-                        f"  即座に処理を停止し、10分間待機します: {request_url}"
+                        f"ブロックの兆候を検出: ステータスコード {res.status_code} ({status_msg})"
+                        f"（開始から{_elapsed_min():.1f}分）: {request_url}"
                     )
+                    # 制限の仕組みを切り分けるため、応答ヘッダーと本文の先頭を残す（2026-10-26）
+                    logger.error(f"  429応答ヘッダー: {dict(res.headers)}")
+                    logger.error(f"  429応答本文(先頭500字): {' '.join(response_text[:500].split())}")
                     return "blocked"
 
                 # 4xx系のクライアントエラーはリトライしない
@@ -683,6 +747,9 @@ def check_single_item(
 
     # （トークン更新・eBay直叩きは司令塔へ移管したため、ここでは不要）
 
+    # 連続稼働が work_minutes を超えたら休む（試験用・既定は無効）
+    _maybe_rest()
+
     # サーバー負荷を考慮してリクエスト送信前にランダムな待機時間
     # （設定ファイルの request_interval_min〜max の範囲。頻度を下げてブロック回避）
     wait_time = random.uniform(
@@ -705,6 +772,10 @@ def check_single_item(
 
     # 在庫チェック
     is_stock = send_request(url, judgment_word)
+
+    # 429後に待って再試行する（試験用・既定は無効＝従来どおり即停止）
+    if is_stock == "blocked" and app_settings.block_probes > 0:
+        is_stock = _probe_after_block(url, judgment_word)
 
     # 403/429エラー（ブロック検出）の場合、特別なフラグを設定
     is_blocked = (is_stock == "blocked")
