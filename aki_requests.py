@@ -184,6 +184,8 @@ class AppSettings:
             self.rest_minutes = float(settings.get('rest_minutes', '0'))
             self.block_probes = int(settings.get('block_probes', '0'))
             self.block_probe_wait_min = float(settings.get('block_probe_wait_min', '10'))
+            self.block_probe_first_wait_min = float(
+                settings.get('block_probe_first_wait_min', str(self.block_probe_wait_min)))
             # 出口IPの交代（2026-10-26: trefacはIPごとに連続約45分で429）。1台に複数IPを持たせ、
             # ip_switch_minutes ごと／429が来た時に次のIPへ切り替える。未設定なら従来どおり既定の出口。
             # trefacへのアクセスだけに使う（司令塔への報告・メルカリ/フリマは既定の出口のまま）。
@@ -373,17 +375,21 @@ def _probe_after_block(url: str, judgment_word: str):
         # 他スレッドが待って回復を確認した直後なら、待たずに1回だけ再試行
         if time.monotonic() - _last_recover < 120:
             return send_request(url, judgment_word)
+        waited = 0.0
         for i in range(1, app_settings.block_probes + 1):
-            logger.warning(f'[試験] 429後 {app_settings.block_probe_wait_min:g}分待って1件だけ試します'
+            # 1回目だけ長く待てる（締め出しは少なくとも35分続くと分かっているため）
+            wait = app_settings.block_probe_first_wait_min if i == 1 else app_settings.block_probe_wait_min
+            logger.warning(f'[試験] 429後 {wait:g}分待って1件だけ試します'
                            f'（{i}/{app_settings.block_probes}回目・開始から{_elapsed_min():.1f}分）: {url}')
-            sleep(app_settings.block_probe_wait_min * 60)
+            sleep(wait * 60)
+            waited += wait
             result = send_request(url, judgment_word)
             if result != "blocked":
-                logger.warning(f'[試験] 回復: 429から{i * app_settings.block_probe_wait_min:g}分で通りました'
+                logger.warning(f'[試験] 回復: 429から{waited:g}分で通りました'
                                f'（開始から{_elapsed_min():.1f}分）→ 巡回を再開します')
                 _last_recover = _work_started = time.monotonic()
                 return result
-            logger.warning(f'[試験] まだ429: 429から{i * app_settings.block_probe_wait_min:g}分経過')
+            logger.warning(f'[試験] まだ429: 429から{waited:g}分経過')
         return "blocked"
 
 
